@@ -3,8 +3,8 @@ import os
 import asyncio
 import re
 from itertools import count
-from collections import defaultdict
 
+import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
@@ -17,14 +17,71 @@ from aiogram.types import (
 )
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
+SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Избранное и ожидающие решения ссылки хранятся в памяти
-favorites = defaultdict(list)
+# Ожидающие решения ссылки пока хранятся в памяти
 pending = {}
 profile_ids = count(1)
+
+
+async def supabase_request(method, path, *, params=None, json=None, headers=None):
+    request_headers = {
+        "apikey": SUPABASE_KEY,
+        "Content-Type": "application/json",
+    }
+    if headers:
+        request_headers.update(headers)
+
+    timeout = aiohttp.ClientTimeout(total=20)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.request(
+            method,
+            f"{SUPABASE_URL}/rest/v1/{path}",
+            params=params,
+            json=json,
+            headers=request_headers,
+        ) as response:
+            if response.status >= 400:
+                error = await response.text()
+                raise RuntimeError(
+                    f"Supabase error {response.status}: {error}"
+                )
+
+            if response.status == 204 or response.content_length == 0:
+                return None
+
+            return await response.json()
+
+
+async def add_favorite(user_id, link):
+    await supabase_request(
+        "POST",
+        "favorites",
+        json={
+            "user_id": user_id,
+            "profile_url": link,
+        },
+        headers={
+            "Prefer": "resolution=ignore-duplicates,return=minimal"
+        },
+    )
+
+
+async def get_favorites(user_id):
+    return await supabase_request(
+        "GET",
+        "favorites",
+        params={
+            "user_id": f"eq.{user_id}",
+            "select": "profile_url",
+            "order": "created_at.desc",
+        },
+    )
 
 
 @dp.message(CommandStart())
@@ -61,17 +118,24 @@ async def show_favorites_command(message: Message):
 
 
 async def send_favorites(message, user_id):
-    user_favorites = favorites[user_id]
+    try:
+        rows = await get_favorites(user_id)
+    except Exception:
+        await message.answer(
+            "Не удалось загрузить избранное. Попробуй ещё раз позже."
+        )
+        return
 
-    if not user_favorites:
+    if not rows:
         await message.answer("В избранном пока ничего нет ❤️")
         return
 
     text = "❤️ Твоё избранное:\n\n"
     text += "\n".join(
-        f"{i}. {link}" for i, link in enumerate(user_favorites, 1)
+        f"{i}. {row['profile_url']}"
+        for i, row in enumerate(rows, 1)
     )
-    await message.answer(text)
+    await message.answer(text, disable_web_page_preview=True)
 
 
 @dp.callback_query(F.data == "show_favorites")
@@ -137,14 +201,24 @@ async def save_profile(callback: CallbackQuery):
     item = pending.get(profile_id)
 
     if not item or item[0] != callback.from_user.id:
-        await callback.answer("Эта ссылка уже обработана.", show_alert=True)
+        await callback.answer(
+            "Эта ссылка уже обработана.",
+            show_alert=True
+        )
         return
 
-    user_id, link = pending.pop(profile_id)
+    user_id, link = item
 
-    if link not in favorites[user_id]:
-        favorites[user_id].append(link)
+    try:
+        await add_favorite(user_id, link)
+    except Exception:
+        await callback.answer(
+            "Не удалось сохранить. Попробуй ещё раз.",
+            show_alert=True
+        )
+        return
 
+    pending.pop(profile_id, None)
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.answer("Сохранено в избранное ❤️")
 
@@ -155,10 +229,13 @@ async def skip_profile(callback: CallbackQuery):
     item = pending.get(profile_id)
 
     if not item or item[0] != callback.from_user.id:
-        await callback.answer("Эта ссылка уже обработана.", show_alert=True)
+        await callback.answer(
+            "Эта ссылка уже обработана.",
+            show_alert=True
+        )
         return
 
-    pending.pop(profile_id)
+    pending.pop(profile_id, None)
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.answer("Профиль пропущен")
 
@@ -204,3 +281,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
